@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance Spot 1H RSI Scanner (v4.1, resilient)
-- 출력: 기본 USDT만, 시총 내림차순 정렬
-- CoinGecko 실패/차단 시 자동으로 **24h 거래대금(quoteVolume) 내림차순**으로 대체 정렬
-- 옵션: --skip-mcap 로 시총 조회를 아예 건너뛰기
+Binance Spot 1H RSI Scanner (v4.2, resilient+binance host fallback)
+- 출력: 기본 USDT만, 시총 내림차순(시총 실패시 24h 거래대금 내림차순 자동 폴백)
+- CoinGecko 호출 실패 시 자동 폴백 유지
+- **Binance API 다중 호스트 폴백**: api, api1, api2, api3, api-gcp
 - KST/UTC 표기, 천단위 콤마, 법정/스테이블 베이스 제외(옵션으로 허용 가능)
 """
 import os, sys, csv, time, asyncio, random
@@ -13,13 +13,21 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import aiohttp
 
-BINANCE_API = "https://api.binance.com"
+# ── Binance & CoinGecko ────────────────────────────────────────────────────────
+BINANCE_API_HOSTS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api-gcp.binance.com",
+]
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 
 DEFAULT_HEADERS = {
-    "User-Agent": "RSI-Scanner/4.1 (+binance-spot-1h-rsi)"
+    "User-Agent": "RSI-Scanner/4.2 (+binance-spot-1h-rsi)"
 }
 
+# ── 기본 파라미터 ─────────────────────────────────────────────────────────────
 BLACKLIST_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR"]
 DEFAULT_QUOTES = ["USDT"]
 DEFAULT_OB = 70.0
@@ -43,6 +51,7 @@ STATIC_CG_MAP = {
     "LDO":"lido-dao","SUI":"sui","APT":"aptos","ARB":"arbitrum","OP":"optimism",
 }
 
+# ── 데이터 구조 ────────────────────────────────────────────────────────────────
 @dataclass
 class SymbolInfo:
     symbol: str
@@ -61,6 +70,7 @@ class ScanResult:
     time_kst: str
     time_utc: str
 
+# ── CLI 파서 ───────────────────────────────────────────────────────────────────
 def parse_args(argv: List[str]) -> Dict:
     args = {
         "quotes": DEFAULT_QUOTES,
@@ -73,17 +83,16 @@ def parse_args(argv: List[str]) -> Dict:
         "timeout": 20,
         "save_csv": True,
         "allow_fiat": False,
-        "only_usdt": True,
-        "sort_key": "marketcap_desc",  # marketcap_desc | rsi | volume
-        "show_n": 0,
+        "only_usdt": True,            # 출력 필터: 기본은 USDT만
+        "sort_key": "marketcap_desc", # marketcap_desc | rsi | volume
+        "show_n": 0,                  # 0 = 제한 없음
         "skip_mcap": False,
     }
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--quotes" and i+1 < len(argv):
-            args["quotes"] = [q.strip().upper() for q in argv[i+1].split(",") if q.strip()]
-            i += 2; continue
+            args["quotes"] = [q.strip().upper() for q in argv[i+1].split(",") if q.strip()]; i += 2; continue
         if a == "--overbought" and i+1 < len(argv):
             args["overbought"] = float(argv[i+1]); i += 2; continue
         if a == "--oversold" and i+1 < len(argv):
@@ -113,21 +122,18 @@ def parse_args(argv: List[str]) -> Dict:
         i += 1
     return args
 
+# ── 유틸 ──────────────────────────────────────────────────────────────────────
 def is_blacklisted(symbol: str) -> bool:
     return any(k in symbol for k in BLACKLIST_SUBSTRINGS)
 
 def should_exclude_base(base: str, allow_fiat: bool) -> bool:
-    if allow_fiat:
-        return False
-    if base in FIAT_BASES:
-        return True
-    if base in STABLE_BASES:
-        return True
+    if allow_fiat: return False
+    if base in FIAT_BASES: return True
+    if base in STABLE_BASES: return True
     return False
 
 def wilder_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
+    if len(closes) < period + 1: return None
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     gains = [max(d, 0.0) for d in deltas]
     losses = [max(-d, 0.0) for d in deltas]
@@ -136,8 +142,7 @@ def wilder_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
+    if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -147,8 +152,7 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict = No
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status in (418, 429, 403, 451, 503):
                     backoff = min(10.0, 1.5 * (attempt + 1)) + random.uniform(0, 0.7)
-                    await asyncio.sleep(backoff)
-                    continue
+                    await asyncio.sleep(backoff); continue
                 resp.raise_for_status()
                 return await resp.json()
         except Exception:
@@ -159,42 +163,49 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: Dict = No
 def make_session(connector):
     return aiohttp.ClientSession(connector=connector, headers=DEFAULT_HEADERS)
 
+def _u(host: str, path: str) -> str:
+    return f"{host}{path}"
+
+async def fetch_any(session: aiohttp.ClientSession, path: str, params: Dict = None, timeout: int = 20):
+    """여러 Binance 호스트를 돌며 첫 성공 응답 반환"""
+    last_err = None
+    for host in BINANCE_API_HOSTS:
+        try:
+            return await fetch_json(session, _u(host, path), params=params, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.7)
+    if last_err:
+        raise last_err
+    raise RuntimeError("No Binance hosts tried")
+
+# ── Binance 호출들(폴백 사용) ─────────────────────────────────────────────────
 async def get_spot_symbols(session: aiohttp.ClientSession, quotes: List[str], allow_fiat: bool, timeout: int) -> List[SymbolInfo]:
-    exinfo = await fetch_json(session, f"{BINANCE_API}/api/v3/exchangeInfo", timeout=timeout)
+    exinfo = await fetch_any(session, "/api/v3/exchangeInfo", timeout=timeout)
     out: List[SymbolInfo] = []
     for s in exinfo.get("symbols", []):
-        if s.get("status", "TRADING") != "TRADING":
-            continue
+        if s.get("status", "TRADING") != "TRADING": continue
         base = s.get("baseAsset"); quote = s.get("quoteAsset"); symbol = s.get("symbol")
-        if not base or not quote or not symbol:
-            continue
-        if quote not in quotes:
-            continue
-        if is_blacklisted(symbol):
-            continue
-        if should_exclude_base(base, allow_fiat):
-            continue
-        permissions = s.get("permissions")
-        is_spot = s.get("isSpotTradingAllowed", None)
-        allowed = False
-        if isinstance(is_spot, bool):
-            allowed = is_spot
-        if not allowed and isinstance(permissions, list):
-            allowed = ("SPOT" in permissions)
-        if not allowed and permissions is None and is_spot is None:
-            allowed = True
-        if allowed:
-            out.append(SymbolInfo(symbol=symbol, base=base, quote=quote))
+        if not base or not quote or not symbol: continue
+        if quote not in quotes: continue
+        if is_blacklisted(symbol): continue
+        if should_exclude_base(base, allow_fiat): continue
+        permissions = s.get("permissions"); is_spot = s.get("isSpotTradingAllowed", None)
+        allowed = isinstance(is_spot, bool) and is_spot
+        if not allowed and isinstance(permissions, list): allowed = ("SPOT" in permissions)
+        if not allowed and permissions is None and is_spot is None: allowed = True
+        if allowed: out.append(SymbolInfo(symbol=symbol, base=base, quote=quote))
     return out
 
 async def get_24h_ticker_map(session: aiohttp.ClientSession, timeout: int) -> Dict[str, Dict]:
-    data = await fetch_json(session, f"{BINANCE_API}/api/v3/ticker/24hr", timeout=timeout)
+    data = await fetch_any(session, "/api/v3/ticker/24hr", timeout=timeout)
     return {d["symbol"]: d for d in data}
 
 async def fetch_klines(session: aiohttp.ClientSession, symbol: str, limit: int, timeout: int) -> List[List]:
     params = {"symbol": symbol, "interval": "1h", "limit": limit}
-    return await fetch_json(session, f"{BINANCE_API}/api/v3/klines", params=params, timeout=timeout)
+    return await fetch_any(session, "/api/v3/klines", params=params, timeout=timeout)
 
+# ── CoinGecko(시총) ───────────────────────────────────────────────────────────
 async def map_cg_ids(session: aiohttp.ClientSession, bases: List[str], timeout: int) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for base in bases:
@@ -204,24 +215,15 @@ async def map_cg_ids(session: aiohttp.ClientSession, bases: List[str], timeout: 
             data = await fetch_json(session, f"{COINGECKO_API}/search", params={"query": base}, timeout=timeout)
             candidates = data.get("coins", [])
             exact = [c for c in candidates if c.get("symbol","").lower() == base.lower()]
-            pick = None
-            def rank_val(x):
-                r = x.get("market_cap_rank")
-                return 10**9 if (r is None) else int(r)
-            if exact:
-                pick = sorted(exact, key=rank_val)[0]
-            elif candidates:
-                pick = sorted(candidates, key=rank_val)[0]
-            if pick and pick.get("id"):
-                out[base] = pick["id"]
-        except Exception:
-            pass
+            def rank_val(x): r = x.get("market_cap_rank"); return 10**9 if (r is None) else int(r)
+            pick = (sorted(exact, key=rank_val)[0] if exact else (sorted(candidates, key=rank_val)[0] if candidates else None))
+            if pick and pick.get("id"): out[base] = pick["id"]
+        except Exception: pass
     return out
 
 async def fetch_market_caps(session: aiohttp.ClientSession, cg_ids: List[str], timeout: int) -> Dict[str, Tuple[float,int]]:
     out: Dict[str, Tuple[float,int]] = {}
-    if not cg_ids:
-        return out
+    if not cg_ids: return out
     ids_param = ",".join(cg_ids[:250])
     try:
         data = await fetch_json(session, f"{COINGECKO_API}/coins/markets", params={"vs_currency":"usd","ids":ids_param}, timeout=timeout)
@@ -233,34 +235,28 @@ async def fetch_market_caps(session: aiohttp.ClientSession, cg_ids: List[str], t
         return {}
     return out
 
+# ── 심볼 스캔 ─────────────────────────────────────────────────────────────────
 async def scan_symbol(session: aiohttp.ClientSession, si: SymbolInfo, limit: int, period: int, ob: float, os_: float, tickers: Dict[str, Dict], min_volume: float, timeout: int, sem: asyncio.Semaphore) -> Optional[ScanResult]:
     async with sem:
         t = tickers.get(si.symbol)
-        if t is None:
-            return None
+        if t is None: return None
         try:
             quote_vol = float(t.get("quoteVolume", "0"))
             price_change_pct = float(t.get("priceChangePercent", "0"))
         except Exception:
-            quote_vol = 0.0
-            price_change_pct = 0.0
-        if quote_vol < min_volume:
-            return None
+            quote_vol = 0.0; price_change_pct = 0.0
+        if quote_vol < min_volume: return None
         kl = await fetch_klines(session, si.symbol, limit, timeout)
         closes = [float(k[4]) for k in kl]
         rsi = wilder_rsi(closes, period=period)
-        if rsi is None:
-            return None
+        if rsi is None: return None
         last_close = closes[-1]
         now_utc = datetime.now(timezone.utc)
         kst = now_utc.astimezone(timezone(timedelta(hours=9)))
         if rsi >= ob or rsi <= os_:
             return ScanResult(
-                symbol=si.symbol,
-                base=si.base,
-                quote=si.quote,
-                rsi=round(rsi, 2),
-                close=last_close,
+                symbol=si.symbol, base=si.base, quote=si.quote,
+                rsi=round(rsi, 2), close=last_close,
                 change_24h_pct=round(price_change_pct, 2),
                 quote_volume_24h=round(quote_vol, 2),
                 time_kst=kst.strftime("%Y-%m-%d %H:%M:%S"),
@@ -274,50 +270,40 @@ async def run_scan(quotes: List[str], overbought: float, oversold: float, period
         symbols = await get_spot_symbols(session, quotes, allow_fiat, timeout=timeout)
         tickers = await get_24h_ticker_map(session, timeout=timeout)
         sem = asyncio.Semaphore(concurrency)
-        tasks = [scan_symbol(session, si, limit, period, overbought, oversold, tickers, min_volume, timeout, sem) for si in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*[scan_symbol(session, si, limit, period, overbought, oversold, tickers, min_volume, timeout, sem) for si in symbols], return_exceptions=True)
         out: List[ScanResult] = []
         for r in results:
-            if isinstance(r, Exception):
-                continue
-            if r is not None:
-                out.append(r)
+            if isinstance(r, Exception): continue
+            if r is not None: out.append(r)
+        # 시총 보강
         if not skip_mcap and out:
             bases = sorted({r.base for r in out})
             cg_map = await map_cg_ids(session, bases, timeout=timeout)
             mc_raw = await fetch_market_caps(session, list(cg_map.values()), timeout=timeout)
-            base_mc: Dict[str, Tuple[float,int]] = {}
-            for b, cid in cg_map.items():
-                base_mc[b] = mc_raw.get(cid, (0.0, 10**9))
+            base_mc: Dict[str, Tuple[float,int]] = {b: mc_raw.get(cid, (0.0, 10**9)) for b, cid in cg_map.items()}
             for r in out:
                 r._market_cap = base_mc.get(r.base, (0.0, 10**9))[0]  # type: ignore
                 r._mc_rank   = base_mc.get(r.base, (0.0, 10**9))[1]  # type: ignore
         else:
             for r in out:
-                r._market_cap = 0.0   # type: ignore
-                r._mc_rank   = 10**9  # type: ignore
+                r._market_cap = 0.0  # type: ignore
+                r._mc_rank   = 10**9 # type: ignore
         return out, symbols
 
+# ── 출력/정렬/알림 ────────────────────────────────────────────────────────────
 def apply_output_filters(results: List[ScanResult], only_usdt: bool) -> List[ScanResult]:
-    x = results
-    if only_usdt:
-        x = [r for r in x if r.quote == "USDT"]
-    return x
+    return [r for r in results if (r.quote == "USDT")] if only_usdt else results
 
 def sort_results(results: List[ScanResult], sort_key: str) -> List[ScanResult]:
-    if sort_key == "rsi":
-        return sorted(results, key=lambda r: r.rsi, reverse=True)
-    if sort_key == "volume":
-        return sorted(results, key=lambda r: r.quote_volume_24h, reverse=True)
+    if sort_key == "rsi": return sorted(results, key=lambda r: r.rsi, reverse=True)
+    if sort_key == "volume": return sorted(results, key=lambda r: r.quote_volume_24h, reverse=True)
     if any(getattr(r, "_market_cap", 0.0) > 0 for r in results):
         return sorted(results, key=lambda r: getattr(r, "_market_cap", 0.0), reverse=True)
-    else:
-        return sorted(results, key=lambda r: r.quote_volume_24h, reverse=True)
+    return sorted(results, key=lambda r: r.quote_volume_24h, reverse=True)
 
 def print_table(results: List[ScanResult], ob: float, os_: float, used_sort: str):
     ob_list = [r for r in results if r.rsi >= ob]
     os_list = [r for r in results if r.rsi <= os_]
-
     def _section(title: str, rows: List[ScanResult]):
         print(f"\n{title} (정렬: {used_sort})")
         print("-" * 130)
@@ -325,20 +311,14 @@ def print_table(results: List[ScanResult], ob: float, os_: float, used_sort: str
         for r in rows:
             mc = getattr(r, "_market_cap", 0.0)
             print(f"{r.symbol:<16}{r.rsi:>8.2f}{r.close:>16,.6f}{r.change_24h_pct:>10.2f}{r.quote_volume_24h:>18,.0f}{mc:>18,.0f}  {r.time_kst:>19}  {r.time_utc:>19}")
-
-    if ob_list:
-        _section("과매수 (USDT만 표시)", ob_list)
-    else:
-        print("\n과매수 없음")
-
-    if os_list:
-        _section("과매도 (USDT만 표시)", os_list)
-    else:
-        print("\n과매도 없음")
+    print("" if ob_list or os_list else "\n신호 없음")
+    if ob_list: _section("과매수 (USDT만 표시)", ob_list)
+    else: print("\n과매수 없음")
+    if os_list: _section("과매도 (USDT만 표시)", os_list)
+    else: print("\n과매도 없음")
 
 def save_csv(results: List[ScanResult]) -> str:
-    if not results:
-        return ""
+    if not results: return ""
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     path = f"rsi_scanner_1h_{ts}.csv"
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -351,20 +331,14 @@ def save_csv(results: List[ScanResult]) -> str:
 
 async def maybe_send_telegram(results: List[ScanResult], ob: float, os_: float, used_sort: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN"); chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
+    if not token or not chat_id: return
     kst = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-    ob_hits = [r for r in results if r.rsi >= ob]
-    os_hits = [r for r in results if r.rsi <= os_]
-    if not ob_hits and not os_hits:
-        return
-    ob_hits = sort_results(ob_hits, used_sort)[:10]
-    os_hits = sort_results(os_hits, used_sort)[:10]
+    ob_hits = sort_results([r for r in results if r.rsi >= ob], used_sort)[:10]
+    os_hits = sort_results([r for r in results if r.rsi <= os_], used_sort)[:10]
+    if not ob_hits and not os_hits: return
     lines = [f"[RSI 1H 스캐너] {kst} KST (USDT & {used_sort})"]
-    if ob_hits:
-        lines.append("과매수: " + ", ".join(f"{r.symbol}({r.rsi:.1f})" for r in ob_hits))
-    if os_hits:
-        lines.append("과매도: " + ", ".join(f"{r.symbol}({r.rsi:.1f})" for r in os_hits))
+    if ob_hits: lines.append("과매수: " + ", ".join(f"{r.symbol}({r.rsi:.1f})" for r in ob_hits))
+    if os_hits: lines.append("과매도: " + ", ".join(f"{r.symbol}({r.rsi:.1f})" for r in os_hits))
     text = "\n".join(lines)
     async with aiohttp.ClientSession(headers=DEFAULT_HEADERS) as session:
         try:
@@ -372,20 +346,15 @@ async def maybe_send_telegram(results: List[ScanResult], ob: float, os_: float, 
         except Exception:
             pass
 
+# ── 엔트리포인트 ─────────────────────────────────────────────────────────────
 async def async_main():
     args = parse_args(sys.argv[1:])
     start = time.time()
     results, symbols = await run_scan(
-        quotes=args["quotes"],
-        overbought=args["overbought"],
-        oversold=args["oversold"],
-        period=args["period"],
-        limit=args["limit"],
-        concurrency=args["concurrency"],
-        min_volume=args["min_volume"],
-        allow_fiat=args["allow_fiat"],
-        skip_mcap=args["skip_mcap"],
-        timeout=args["timeout"],
+        quotes=args["quotes"], overbought=args["overbought"], oversold=args["oversold"],
+        period=args["period"], limit=args["limit"], concurrency=args["concurrency"],
+        min_volume=args["min_volume"], allow_fiat=args["allow_fiat"],
+        skip_mcap=args["skip_mcap"], timeout=args["timeout"],
     )
     filtered = apply_output_filters(results, args["only_usdt"])
     sorted_list = sort_results(filtered, args["sort_key"])
@@ -394,20 +363,13 @@ async def async_main():
         used_sort = "volume"
     if args["show_n"] and args["show_n"] > 0:
         sorted_list = sorted_list[:args["show_n"]]
-
     print(f"[완료] 스캔 심볼 수: {len(symbols)} | 히트 수: {len(results)} | 표시 수: {len(sorted_list)} | 경과: {time.time()-start:.1f}s")
     print(f"필터: QUOTES={args['quotes']} PERIOD={args['period']} OB={args['overbought']} OS={args['oversold']} MIN_VOL={args['min_volume']} ONLY_USDT={args['only_usdt']} SORT={used_sort} SKIP_MCAP={args['skip_mcap']}")
     print_table(sorted_list, args["overbought"], args["oversold"], used_sort)
-
     if args["save_csv"]:
         path = save_csv(sorted_list)
-        if path:
-            print(f"\nCSV 저장: {path}")
-
+        if path: print(f"\nCSV 저장: {path}")
     await maybe_send_telegram(sorted_list, args["overbought"], args["oversold"], used_sort)
 
-def main():
-    asyncio.run(async_main())
-
-if __name__ == "__main__":
-    main()
+def main(): asyncio.run(async_main())
+if __name__ == "__main__": main()
