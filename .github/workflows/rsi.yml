@@ -1,0 +1,36 @@
+name: RSI 1H Scanner
+
+on:
+  schedule:
+    - cron: "5 * * * *"   # 매시 05분(UTC)마다 실행. KST 기준으론 매시 14분쯤 알림 도착 가능
+  workflow_dispatch:       # 필요 시 수동 실행 버튼
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: rsi-scan
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RSI scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python rsi_scanner_binance_1h_v4_1.py --min-volume 5000000 --quotes USDT,FDUSD
+          # CoinGecko 시총이 자주 막히면 아래 라인으로 교체(거래대금 정렬):
+          # python rsi_scanner_binance_1h_v4_1.py --min-volume 5000000 --quotes USDT,FDUSD --skip-mcap
