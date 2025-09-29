@@ -1,9 +1,7 @@
-name: RSI 1H Scanner
+name: RSI 1H Scanner (diag)
 
 on:
-  schedule:
-    - cron: "5 * * * *"   # 매시 05분(UTC) 실행
-  workflow_dispatch:       # 수동 실행 버튼
+  workflow_dispatch:       # 수동 실행만. (원인 파악 끝나면 스케줄 다시 켭니다)
 
 jobs:
   scan:
@@ -23,10 +21,30 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Show workspace & versions
+        run: |
+          echo "::group::Workspace"
+          pwd
+          ls -la
+          echo "::endgroup::"
+          echo "::group::Python/Pip"
+          python -V
+          python -m pip -V || true
+          echo "::endgroup::"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python - <<'PY'
+import sys
+try:
+    import aiohttp
+    print("IMPORT_OK aiohttp", aiohttp.__version__)
+except Exception as e:
+    print("IMPORT_FAIL", e)
+    sys.exit(1)
+PY
 
       - name: Network check
         run: |
@@ -35,10 +53,11 @@ jobs:
           echo "CoinGecko ping:"
           curl -s -S -w "\nHTTP %{http_code}\n" https://api.coingecko.com/api/v3/ping || true
 
-      # 시총 호출 불안정 대비: --skip-mcap 사용(거래대금 정렬로 자동 대체)
-      - name: Run RSI scanner
+      # 스캐너는 '소프트 실행': 실패해도 잡은 성공으로 유지(원인 파악이 목적)
+      - name: Run RSI scanner (soft)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python rsi_scanner_binance_1h_v4_1.py --min-volume 5000000 --quotes USDT,FDUSD --skip-mcap --timeout 30
+          set -x
+          python rsi_scanner_binance_1h_v4_1.py --min-volume 5000000 --quotes USDT,FDUSD --skip-mcap --timeout 30 || true
