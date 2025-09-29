@@ -16,10 +16,12 @@ import aiohttp
 # ── Binance & CoinGecko ────────────────────────────────────────────────────────
 BINANCE_API_HOSTS = [
     "https://api.binance.com",
+    "https://api-gcp.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
-    "https://api-gcp.binance.com",
+    "https://api4.binance.com",
+    "https://data-api.binance.vision",  # 공개 미러(가끔만 열릴 수 있음)
 ]
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 
@@ -373,3 +375,4 @@ async def async_main():
 
 def main(): asyncio.run(async_main())
 if __name__ == "__main__": main()
+
