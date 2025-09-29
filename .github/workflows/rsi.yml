@@ -1,4 +1,4 @@
-name: RSI 1H Scanner (diag2)
+name: RSI 1H Scanner (diag2 + Binance mirrors)
 
 on:
   workflow_dispatch:   # 수동 실행만
@@ -22,12 +22,11 @@ jobs:
           echo "PWD:"; pwd
           echo "TREE:"; ls -la
 
-      # 스크립트가 저장소 '루트'에 있는지 확인
+      # 스크립트가 저장소 '루트'에 있어야 함
       - name: Ensure script exists
         run: |
           test -f rsi_scanner_binance_1h_v4_1.py || (echo "ERROR: SCRIPT_NOT_FOUND at repo root" && exit 1)
 
-      # 의존성 설치 (requirements 없이도 동작하도록 최소만)
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -36,9 +35,20 @@ jobs:
       - name: Import check
         run: python -c "import aiohttp,sys; print('IMPORT_OK aiohttp', aiohttp.__version__)"
 
-      - name: Network check
+      - name: Network check (Binance mirrors)
         run: |
-          echo "Binance ping:"; curl -s -S -w "\nHTTP %{http_code}\n" https://api.binance.com/api/v3/ping || true
+          for h in \
+            https://api.binance.com \
+            https://api-gcp.binance.com \
+            https://api1.binance.com \
+            https://api2.binance.com \
+            https://api3.binance.com \
+            https://api4.binance.com \
+            https://data-api.binance.vision
+          do
+            echo "Ping $h"
+            curl -s -S -w "\nHTTP %{http_code}\n" "$h/api/v3/ping" || true
+          done
 
       - name: Run scanner (skip mcap)
         env:
